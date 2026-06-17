@@ -474,8 +474,8 @@ class OfflineDAPOTrainer:
         self.rank = torch.distributed.get_rank()
         self._build_config()
         self._build_dataset()
-        self._build_engine()
-        self._build_dataloader()
+        self._build_engine() # The loss function is registered here!
+        self._build_dataloader() # Here DistributedSampler API splits 1/nproc data points evenly to the current proc
         self._init_engine()
         self._build_ckpt_handler()
         if self.rank == 0:
@@ -603,6 +603,8 @@ class OfflineDAPOTrainer:
         return output_tensor.tolist()
 
     def fit(self):
+        """Run the single DAPO update for this worker process."""
+
         from tensordict.tensorclass import NonTensorData
 
         from verl.utils import tensordict_utils as tu
@@ -611,6 +613,8 @@ class OfflineDAPOTrainer:
         from verl.utils.metric.utils import reduce_metrics
         from verl.utils.tracking import Tracking
 
+        # Only one rank should create experiment logs. All ranks still execute
+        # the same data-loading and training path below.
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
         tracking = None
         if is_logging:
@@ -623,10 +627,14 @@ class OfflineDAPOTrainer:
                 config=OmegaConf.to_container(self.config, resolve=True),
             )
 
+        # The script is designed for exactly one optimizer update. If a resumed
+        # checkpoint already reached step 1, skip instead of replaying the batch.
         if self.resume_global_step >= 1:
             log_with_rank("Checkpoint already has global_step >= 1; skipping one-update DAPO run.", rank=0)
             return
 
+        # Metadata consumed by verl/Megatron for no-padding batches,
+        # microbatch splitting, and token-level loss normalization.
         meta_info = {
             "use_remove_padding": self.config.model.use_remove_padding,
             "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
@@ -639,6 +647,9 @@ class OfflineDAPOTrainer:
         }
 
         aggressive_empty_cache(force_sync=True)
+
+        # Each DP rank receives one dataloader batch: its shard of all converted
+        # offline DAPO step samples. A second batch would imply a second update.
         data_iter = iter(self.train_dataloader)
         data = next(data_iter)
         try:
@@ -649,6 +660,9 @@ class OfflineDAPOTrainer:
 
         data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
         batch_seqlens = self._get_batch_seqlens(data)
+
+        # Attach per-step controls for TrainingWorker. global_token_num is
+        # gathered across DP ranks and used by dapo_policy_loss's denominator.
         tu.assign_non_tensor(
             data,
             update_lr_scheduler=True,
@@ -656,7 +670,12 @@ class OfflineDAPOTrainer:
             disable_auto_offload=True,
         )
 
+        # This single call performs zero-grad, microbatch forward/backward
+        # accumulation, DP gradient sync, optimizer step, and LR scheduler step.
         output = self.training_client.train_batch(data=data)
+
+        # Reduce metrics across ranks, rename common training metrics, and log a
+        # compact summary from the output/source rank.
         if self.engine.is_mp_src_rank_with_outputs():
             metrics = tu.get(output, "metrics")
             metrics = reduce_metrics(metrics)
@@ -674,6 +693,8 @@ class OfflineDAPOTrainer:
                 print("DAPO metrics:", renamed, flush=True)
 
         aggressive_empty_cache(force_sync=True)
+
+        # Save the post-update model at global step 1.
         self.ckpt_handler.save_checkpoint(step=1)
 
 
