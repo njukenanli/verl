@@ -225,6 +225,8 @@ def convert_json_to_parquet(
         raise ValueError("--step-penalty-threshold must be non-negative")
     if max_steps < step_penalty_threshold:
         raise ValueError("--max-steps must be greater than or equal to --step-penalty-threshold")
+    if expected_trajs_per_group < 0:
+        raise ValueError("--expected-trajs-per-group must be non-negative")
 
     with json_path.open("r", encoding="utf-8") as f:
         groups = json.load(f)
@@ -235,10 +237,23 @@ def convert_json_to_parquet(
             raise ValueError(f"dapo.json has {len(groups)} groups, but --num-groups={num_groups}")
         groups = groups[:num_groups]
 
+    normalized_groups: list[list[Any]] = []
+    for group_idx, group in enumerate(groups):
+        group = _as_list(group)
+        if not isinstance(group, list):
+            raise TypeError(f"group {group_idx}: expected list, got {type(group).__name__}")
+        normalized_groups.append(group)
+    groups = normalized_groups
+
+    detected_group_size = max((len(group) for group in groups), default=0)
+    group_size = expected_trajs_per_group or detected_group_size
+
     rows: list[dict[str, Any]] = []
     stats: dict[str, int | float] = {
         "groups": len(groups),
+        "group_size": group_size,
         "groups_without_valid_steps": 0,
+        "groups_with_zero_advantage": 0,
         "groups_with_nonstandard_traj_count": 0,
         "trajectories": 0,
         "trajectories_truncated": 0,
@@ -252,16 +267,13 @@ def convert_json_to_parquet(
     }
 
     for group_idx, group in enumerate(groups):
-        group = _as_list(group)
-        if not isinstance(group, list):
-            raise TypeError(f"group {group_idx}: expected list, got {type(group).__name__}")
-        if expected_trajs_per_group > 0 and len(group) != expected_trajs_per_group:
+        if len(group) != group_size:
             stats["groups_with_nonstandard_traj_count"] += 1
             raise ValueError(
-                f"group {group_idx}: expected {expected_trajs_per_group} trajectories, got {len(group)}"
+                f"group {group_idx}: expected {group_size} trajectories, got {len(group)}"
             )
 
-        candidates: list[dict[str, Any]] = []
+        trajectories: list[dict[str, Any]] = []
         for traj_idx, trajectory in enumerate(group):
             trajectory = _as_list(trajectory)
             if not isinstance(trajectory, list):
@@ -269,6 +281,17 @@ def convert_json_to_parquet(
             stats["trajectories"] += 1
             stats["steps_seen"] += len(trajectory)
             if not trajectory:
+                # The current JSON format repeats a trajectory's final reward
+                # on every step. An empty trajectory therefore cannot carry a
+                # reward explicitly. SWE-agent only emits an empty trajectory
+                # when no model step ran, which is an unsuccessful rollout.
+                trajectories.append(
+                    {
+                        "raw_reward": 0.0,
+                        "effective_reward": 0.0,
+                        "candidates": [],
+                    }
+                )
                 continue
 
             capped_steps = min(len(trajectory), max_steps)
@@ -337,55 +360,70 @@ def convert_json_to_parquet(
                 threshold=step_penalty_threshold,
                 max_step=max_steps,
             )
-            for candidate in traj_candidates:
-                candidate["raw_reward"] = raw_reward
-                candidate["effective_reward"] = effective_reward
-                candidates.append(candidate)
+            trajectories.append(
+                {
+                    "raw_reward": raw_reward,
+                    "effective_reward": effective_reward,
+                    "candidates": traj_candidates,
+                }
+            )
 
-        if not candidates:
+        if not trajectories:
             stats["groups_without_valid_steps"] += 1
             continue
 
-        rewards = [float(candidate["effective_reward"]) for candidate in candidates]
+        # GRPO normalization is over trajectories, not input-output steps.
+        # Each trajectory contributes its final reward exactly once regardless
+        # of how many retained conversation steps it contains.
+        rewards = [float(trajectory["effective_reward"]) for trajectory in trajectories]
         group_mean, group_std = _group_mean_std(rewards, ddof=std_ddof)
 
-        for candidate in candidates:
-            if group_std <= std_epsilon:
-                advantage = 0.0
-            else:
-                advantage = (float(candidate["effective_reward"]) - group_mean) / (group_std + std_epsilon)
+        if group_std <= std_epsilon:
+            stats["groups_with_zero_advantage"] += 1
+            stats["discard_zero_advantage"] += sum(
+                len(trajectory["candidates"]) for trajectory in trajectories
+            )
+            continue
+
+        if not any(trajectory["candidates"] for trajectory in trajectories):
+            stats["groups_without_valid_steps"] += 1
+            continue
+
+        for trajectory in trajectories:
+            advantage = (float(trajectory["effective_reward"]) - group_mean) / (group_std + std_epsilon)
             if abs(advantage) <= zero_adv_epsilon:
-                stats["discard_zero_advantage"] += 1
+                stats["discard_zero_advantage"] += len(trajectory["candidates"])
                 continue
 
-            prompt_ids = candidate["input_prompt_ids"]
-            output_ids = candidate["output_ids"]
-            input_ids = prompt_ids + output_ids
-            response_tokens = len(output_ids)
-            loss_mask = [0] * len(prompt_ids) + [1] * response_tokens
-            old_log_probs = [0.0] * len(prompt_ids) + candidate["output_old_log_probs"]
-            advantages = [0.0] * len(prompt_ids) + [float(advantage)] * response_tokens
-            loss_mask[0] = 0
-            old_log_probs[0] = 0.0
-            advantages[0] = 0.0
+            for candidate in trajectory["candidates"]:
+                prompt_ids = candidate["input_prompt_ids"]
+                output_ids = candidate["output_ids"]
+                input_ids = prompt_ids + output_ids
+                response_tokens = len(output_ids)
+                loss_mask = [0] * len(prompt_ids) + [1] * response_tokens
+                old_log_probs = [0.0] * len(prompt_ids) + candidate["output_old_log_probs"]
+                advantages = [0.0] * len(prompt_ids) + [float(advantage)] * response_tokens
+                loss_mask[0] = 0
+                old_log_probs[0] = 0.0
+                advantages[0] = 0.0
 
-            rows.append(
-                {
-                    "input_ids": input_ids,
-                    "loss_mask": loss_mask,
-                    "old_log_probs": old_log_probs,
-                    "advantages": advantages,
-                    "seq_len": len(input_ids),
-                    "response_tokens": int(sum(loss_mask)),
-                    "group_idx": int(candidate["group_idx"]),
-                    "traj_idx": int(candidate["traj_idx"]),
-                    "step_idx": int(candidate["step_idx"]),
-                    "raw_reward": float(candidate["raw_reward"]),
-                    "effective_reward": float(candidate["effective_reward"]),
-                    "advantage": float(advantage),
-                    "is_padding": False,
-                }
-            )
+                rows.append(
+                    {
+                        "input_ids": input_ids,
+                        "loss_mask": loss_mask,
+                        "old_log_probs": old_log_probs,
+                        "advantages": advantages,
+                        "seq_len": len(input_ids),
+                        "response_tokens": int(sum(loss_mask)),
+                        "group_idx": int(candidate["group_idx"]),
+                        "traj_idx": int(candidate["traj_idx"]),
+                        "step_idx": int(candidate["step_idx"]),
+                        "raw_reward": float(trajectory["raw_reward"]),
+                        "effective_reward": float(trajectory["effective_reward"]),
+                        "advantage": float(advantage),
+                        "is_padding": False,
+                    }
+                )
 
     if not rows:
         raise ValueError("no nonzero-advantage training samples found after conversion")
@@ -714,7 +752,15 @@ def _arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default="Qwen/Qwen3-8B")
     parser.add_argument("--save-path", default="checkpoints/dapo/qwen3-8b-megatron")
     parser.add_argument("--num-groups", type=int, default=64, help="Number of SWE task groups to train on; 0 means all.")
-    parser.add_argument("--expected-trajs-per-group", type=int, default=8)
+    parser.add_argument(
+        "--expected-trajs-per-group",
+        type=int,
+        default=0,
+        help=(
+            "Expected trajectories in every task group. Default: 0, which detects "
+            "max(len(group)) from the selected dapo.json groups."
+        ),
+    )
     parser.add_argument("--nproc", type=int, default=8)
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)

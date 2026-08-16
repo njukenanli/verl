@@ -167,10 +167,19 @@ Expected `dapo.json`:
 
 ```text
 list[group]
-group = list[trajectory]                         # one SWE task, normally 8 trajectories
+group = list[trajectory]                         # one SWE task; size comes from the uploaded JSON
 trajectory = list[[input_ids, output_pairs, r]]  # r is the same 0/1 reward for every step
 output_pairs = list[[output_token_id, vllm_probability]]
 ```
+
+An empty trajectory `[]` is a placeholder for a missing/failed sample. It
+contributes reward 0 to trajectory-level normalization and contributes no
+generated tokens to training.
+
+By default, the converter detects the trajectory group size as
+`max(len(group) for group in groups)` and verifies that every selected group has
+that size. Pass a positive `--expected-trajs-per-group` only to enforce an
+explicit override.
 
 The converter builds one training sample per input-output step:
 
@@ -178,7 +187,8 @@ The converter builds one training sample per input-output step:
 input_ids = input_ids + output_token_ids
 loss_mask = 0 on input tokens, 1 on output tokens
 old_log_probs = log(vllm_probability) on output tokens
-advantages = group-normalized reward on output tokens
+advantages = trajectory reward normalized once across the task's trajectories,
+             then copied to every output token of that trajectory
 ```
 
 It implements the DAPO requirements used here:
