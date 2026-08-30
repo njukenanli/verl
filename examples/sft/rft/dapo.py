@@ -858,7 +858,9 @@ def _torchrun_command(args: argparse.Namespace, global_batch_size: int) -> list[
         "engine.use_distributed_optimizer=True",
         "engine.use_megatron_fsdp=True",
         "engine.use_mbridge=True",
-        "engine.vanilla_mbridge=False",
+        # VERL's Qwen3.5 recipes use mbridge's registered Qwen3_5VlBridge.
+        # This also avoids importing Megatron-Bridge's optional ModelOpt stack.
+        "engine.vanilla_mbridge=True",
         "engine.override_transformer_config.recompute_granularity=full",
         "engine.override_transformer_config.recompute_method=uniform",
         "engine.override_transformer_config.recompute_num_layers=1",

@@ -6,7 +6,7 @@ for B200.
 On the host:
 
 ```bash
-docker pull verlai/verl:vllm024.latest
+docker pull verlai/verl:vllm024.dev2
 
 docker run --rm -it \
   --gpus all \
@@ -20,7 +20,7 @@ docker run --rm -it \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -w /workspace/verl \
   --name verl-rft-rl \
-  verlai/verl:vllm024.latest \
+  verlai/verl:vllm024.dev2 \
   bash
 ```
 
