@@ -839,7 +839,9 @@ def _torchrun_command(args: argparse.Namespace, global_batch_size: int) -> list[
         "model=hf_model",
         f"model.path={args.model_path}",
         "model.trust_remote_code=True",
-        "model.use_remove_padding=True",
+        # Qwen3.5 GDN layers do not support Megatron's packed THD format.
+        # False selects the padded BSHD path while data.use_dynamic_bsz remains disabled.
+        "model.use_remove_padding=False",
         "optim=megatron",
         f"optim.lr={args.lr}",
         f"optim.min_lr={args.min_lr}",

@@ -6,7 +6,7 @@ for B200.
 On the host:
 
 ```bash
-docker pull verlai/verl:vllm017.latest
+docker pull verlai/verl:vllm024.latest
 
 docker run --rm -it \
   --gpus all \
@@ -20,7 +20,7 @@ docker run --rm -it \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -w /workspace/verl \
   --name verl-rft-rl \
-  verlai/verl:vllm017.latest \
+  verlai/verl:vllm024.latest \
   bash
 ```
 
@@ -35,9 +35,13 @@ import pandas
 import pyarrow
 import megatron.core
 import transformer_engine
+import transformers
+import vllm
 
 print("cuda:", torch.version.cuda)
 print("gpus:", torch.cuda.device_count())
+print("transformers:", transformers.__version__)
+print("vllm:", vllm.__version__)
 PY
 ```
 
