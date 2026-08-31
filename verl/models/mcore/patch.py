@@ -17,6 +17,43 @@
 # 1. `get_query_key_value_tensors` in `multi_latent_attention.py` works wrong when packed_seq_params is not None
 
 
+def _patch_gated_delta_net_cp_comm_type() -> None:
+    """Accept TransformerLayer's generic CP keyword on older GDN implementations.
+
+    Megatron-Core 0.18.0 passes ``cp_comm_type`` to attention-like modules when
+    context parallelism is enabled, but its GatedDeltaNet constructor predates
+    that keyword. GDN uses its own context-parallel collectives through
+    ``pg_collection.cp``, so newer Megatron versions accept and ignore the
+    generic keyword. Mirror that compatibility behavior only when it is absent.
+    """
+    import inspect
+    from functools import wraps
+
+    try:
+        from megatron.core.ssm import gated_delta_net
+    except ImportError:
+        return
+
+    for class_name in ("GatedDeltaNet", "GatedDeltaNet2"):
+        gated_delta_net_cls = getattr(gated_delta_net, class_name, None)
+        if gated_delta_net_cls is None:
+            continue
+
+        original_init = gated_delta_net_cls.__init__
+        if getattr(original_init, "_verl_cp_comm_type_compat", False):
+            continue
+        if "cp_comm_type" in inspect.signature(original_init).parameters:
+            continue
+
+        @wraps(original_init)
+        def compatible_init(self, *args, __original_init=original_init, cp_comm_type=None, **kwargs):
+            del cp_comm_type
+            return __original_init(self, *args, **kwargs)
+
+        compatible_init._verl_cp_comm_type_compat = True
+        gated_delta_net_cls.__init__ = compatible_init
+
+
 def apply_patch():
     import megatron.core
     import torch
@@ -361,6 +398,8 @@ def apply_patch():
 
 
 def apply_patch_mbridge():
+    _patch_gated_delta_net_cp_comm_type()
+
     try:
         from megatron.core.utils import get_tensor_model_parallel_group_if_none
     except ImportError:
