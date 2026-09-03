@@ -856,7 +856,12 @@ def _torchrun_command(args: argparse.Namespace, global_batch_size: int) -> list[
         f"engine.pipeline_model_parallel_size={args.pp}",
         f"engine.context_parallel_size={args.cp}",
         "engine.use_distributed_optimizer=True",
-        "engine.use_megatron_fsdp=True",
+        # Qwen3.5 uses the vanilla mbridge path below. That path currently
+        # constructs Megatron DDP rather than Megatron FSDP, so advertising
+        # FSDP here makes checkpointing select the incompatible fsdp_dtensor
+        # optimizer format. Keep the distributed optimizer, and make the
+        # checkpoint manager follow the DDP model that was actually built.
+        "engine.use_megatron_fsdp=False",
         "engine.use_mbridge=True",
         # VERL's Qwen3.5 recipes use mbridge's registered Qwen3_5VlBridge.
         # This also avoids importing Megatron-Bridge's optional ModelOpt stack.
